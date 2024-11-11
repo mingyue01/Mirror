@@ -4,6 +4,7 @@ using System.Collections.Generic;
 using System.Runtime.CompilerServices;
 using Mirror;
 using UnityEngine;
+using Google.Protobuf;
 
 namespace Network
 {
@@ -81,7 +82,7 @@ namespace Network
 
         // Send stage one: NetworkMessage<T>
         /// <summary>Send a NetworkMessage to this connection over the given channel.</summary>
-        public void Send<T>(ushort protoId, T message, int channelId = Channels.Reliable)
+        public void Send<T>(ushort protoId, T message, int channelId = Channels.Reliable) where T : IMessage
             //where T : struct, NetworkMessage
         {
             using (NetworkWriterPooled writer = NetworkWriterPool.Get())
