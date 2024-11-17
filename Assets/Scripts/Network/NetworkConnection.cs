@@ -136,5 +136,68 @@ namespace Network
             //       will be the full batch, including timestamp.
             GetBatchForChannelId(channelId).AddMessage(segment, NetworkTime.localTime);
         }
+
+        protected abstract void SendToTransport(ArraySegment<byte> segment, int channelId = Channels.Reliable);
+
+        internal virtual void Update()
+        {
+            // go through batches for all channels
+            // foreach ((int key, Batcher batcher) in batches) // Unity 2020 doesn't support deconstruct yet
+            foreach (KeyValuePair<int, Batcher> kvp in batches)
+            {
+                // make and send as many batches as necessary from the stored
+                // messages.
+                using (NetworkWriterPooled writer = NetworkWriterPool.Get())
+                {
+                    // make a batch with our local time (double precision)
+                    while (kvp.Value.GetBatch(writer))
+                    {
+                        // message size is validated in Send<T>, with test coverage.
+                        // we can send directly without checking again.
+                        ArraySegment<byte> segment = writer.ToArraySegment();
+
+                        // send to transport
+                        SendToTransport(segment, kvp.Key);
+                        //UnityEngine.Debug.Log($"sending batch of {writer.Position} bytes for channel={kvp.Key} connId={connectionId}");
+
+                        // reset writer for each new batch
+                        writer.Position = 0;
+                    }
+                }
+            }
+        }
+
+        /// <summary>Check if we received a message within the last 'timeout' seconds.</summary>
+        internal virtual bool IsAlive(float timeout) => Time.time - lastMessageTime < timeout;
+
+        /// <summary>Disconnects this connection.</summary>
+        // for future reference, here is how Disconnects work in Mirror.
+        //
+        // first, there are two types of disconnects:
+        // * voluntary: the other end simply disconnected
+        // * involuntary: server disconnects a client by itself
+        //
+        // UNET had special (complex) code to handle both cases differently.
+        //
+        // Mirror handles both cases the same way:
+        // * Disconnect is called from TOP to BOTTOM
+        //   NetworkServer/Client -> NetworkConnection -> Transport.Disconnect()
+        // * Disconnect is handled from BOTTOM to TOP
+        //   Transport.OnDisconnected -> ...
+        //
+        // in other words, calling Disconnect() does no cleanup whatsoever.
+        // it simply asks the transport to disconnect.
+        // then later the transport events will do the clean up.
+        public abstract void Disconnect();
+
+        public virtual void Cleanup()
+        {
+            foreach (Batcher batcher in batches.Values)
+            {
+                batcher.Clear();
+            }
+        }
+
+        public override string ToString() => $"connection({connectionId})";
     }
 }
