@@ -134,6 +134,7 @@ namespace Network
                 // predictedTime parameter is 0 because the server doesn't predict.
                 NetworkPingMessage pingMessage = new NetworkPingMessage(NetworkTime.localTime, 0);
                 //Send(pingMessage, Channels.Unreliable);
+                //todo: implement
                 throw new NotImplementedException("need send ping message");
                 lastPingTime = NetworkTime.localTime;
             }
