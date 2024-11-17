@@ -4,7 +4,6 @@ using System.Collections.Generic;
 using System;
 using System.Text;
 using UnityEngine;
-using Msg;
 
 namespace Network
 {
@@ -75,14 +74,69 @@ namespace Network
         // version for handlers with channelId
         // inline! only exists for 20-30 messages and they call it all the time.
         internal static NetworkMessageDelegate WrapHandler<T, C>(Action<C, T, int> handler, int messageId, bool requireAuthentication, bool exceptionsDisconnect)
-            where T : struct, IMessage
+            where T : IMessage
             where C : NetworkConnection
             => (conn, reader, channeldId) =>
             {
-                //todo: read message
-                //var bytes = new byte[1];
-                
-                //MessageResult.Descriptor.Parser.ParseFrom(bytes);               
+                T message = default;
+                int startPos = reader.Position;
+                try
+                {
+                    if (requireAuthentication && !conn.isAuthenticated)
+                    {
+                        // message requires authentication, but the connection was not authenticated
+                        Debug.LogWarning($"Disconnecting connection: {conn}. Received message {typeof(T)} that required authentication, but the user has not authenticated yet");
+                        conn.Disconnect();
+                        return;
+                    }
+
+                    var parser = NetMsgConfig.GetMsgParser(messageId);
+                    var bytes = reader.ReadBytes(reader.Remaining);
+                    message = (T)parser.ParseFrom(bytes);
+                }
+                catch (Exception exception)
+                {
+                    // should we disconnect on exceptions?
+                    if (exceptionsDisconnect)
+                    {
+                        Debug.LogError($"Disconnecting connection: {conn} because reading a message of type {typeof(T)} caused an Exception. This can happen if the other side accidentally (or an attacker intentionally) sent invalid data. Reason: {exception}");
+                        conn.Disconnect();
+                        return;
+                    }
+                    // otherwise log it but allow the connection to keep playing
+                    else
+                    {
+                        Debug.LogError($"Caught an Exception when reading a message from: {conn} of type {typeof(T)}. Reason: {exception}");
+                        return;
+                    }
+                }
+                finally
+                {
+                    int endPos = reader.Position;
+                    // TODO: Figure out the correct channel
+                    //NetworkDiagnostics.OnReceive(message, channelId, endPos - startPos);
+                }
+
+                // user handler exception should not stop the whole server
+                try
+                {
+                    // user implemented handler
+                    handler((C)conn, message, channeldId);
+                }
+                catch(Exception exception)
+                {
+                    // should we disconnect on exceptions?
+                    if (exceptionsDisconnect)
+                    {
+                        Debug.LogError($"Disconnecting connection: {conn} because handling a message of type {typeof(T)} caused an Exception. This can happen if the other side accidentally (or an attacker intentionally) sent invalid data. Reason: {exception}");
+                        conn.Disconnect();
+                    }
+                    // otherwise log it but allow the connection to keep playing
+                    else
+                    {
+                        Debug.LogError($"Caught an Exception when handling a message from: {conn} of type {typeof(T)}. Reason: {exception}");
+                    }
+                }
             };
     }
 }
