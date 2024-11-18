@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Linq;
 using Mirror;
 using UnityEngine;
 
@@ -93,6 +94,9 @@ namespace Network
         // capture full Unity update time from before Early- to after LateUpdate
         public static TimeSample fullUpdateDuration;
 
+        internal static readonly List<NetworkConnectionToClient> connectionsCopy =
+    new List<NetworkConnectionToClient>();
+
         /// <summary>Starts server and listens to incoming connections with max connections limit.</summary>
         public static void Listen(int maxConns)
         {
@@ -171,10 +175,72 @@ namespace Network
 //#pragma warning restore CS0618 // Type or member is obsolete
             Transport.active.OnServerConnectedWithAddress += OnTransportConnectedWithAddress;
             Transport.active.OnServerDataReceived += OnTransportData;
+            Transport.active.OnServerDisconnected += OnTransportDisconnected;
+            Transport.active.OnServerError += OnTransportError;
+            Transport.active.OnServerTransportException += OnTransportException;
+        }
+
+        /// <summary>Shuts down the server and disconnects all clients</summary>
+        // RuntimeInitializeOnLoadMethod -> fast playmode without domain reload
+        [RuntimeInitializeOnLoadMethod(RuntimeInitializeLoadType.BeforeSceneLoad)]
+        public static void Shutdown()
+        {
+            if (initialized)
+            {
+                DisconnectAll();
+
+                // stop the server.
+                // we do NOT call Transport.Shutdown, because someone only
+                // called NetworkServer.Shutdown. we can't assume that the
+                // client is supposed to be shut down too!
+                //
+                // NOTE: stop no matter what, even if 'dontListen':
+                //       someone might enabled dontListen at runtime.
+                //       but we still need to stop the server.
+                //       fixes https://github.com/vis2k/Mirror/issues/2536
+                Transport.active.ServerStop();
+
+                // transport handlers are hooked into when initializing.
+                // so only remove them when shutting down.
+                RemoveTransportHandlers();
+
+                initialized = false;
+            }
+
+            // Reset all statics here....
+            listen = true;
+            isLoadingScene = false;
+            lastSendTime = 0;
+            actualTickRate = 0;
+
+            //localConnection = null;
+
+            connections.Clear();
+            connectionsCopy.Clear();
+            handlers.Clear();
+
+            // destroy all spawned objects, _then_ set inactive.
+            // make sure .active is still true before calling this.
+            // otherwise modifying SyncLists in OnStopServer would throw
+            // because .IsWritable() check checks if NetworkServer.active.
+            // https://github.com/MirrorNetworking/Mirror/issues/3344
+            //CleanupSpawned();
+            active = false;
+
+            // sets nextNetworkId to 1
+            // sets clientAuthorityCallback to null
+            // sets previousLocalPlayer to null
             //todo
-            //Transport.active.OnServerDisconnected += OnTransportDisconnected;
-            //Transport.active.OnServerError += OnTransportError;
-            //Transport.active.OnServerTransportException += OnTransportException;
+            //NetworkIdentity.ResetStatics();
+
+            // clear events. someone might have hooked into them before, but
+            // we don't want to use those hooks after Shutdown anymore.
+            OnConnectedEvent = null;
+            OnDisconnectedEvent = null;
+            OnErrorEvent = null;
+            OnTransportExceptionEvent = null;
+
+            if (aoi != null) aoi.ResetState();
         }
 
         static bool IsConnectionAllowed(int connectionId, string address)
@@ -261,7 +327,7 @@ namespace Network
                 if (handlers.TryGetValue(msgType, out NetworkMessageDelegate handler))
                 {
                     //todo
-                    //handler.Invoke(connection, reader, channelId);
+                    handler.Invoke(connection, reader, channelId);
                     connection.lastMessageTime = Time.time;
                     return true;
                 }
@@ -391,10 +457,122 @@ namespace Network
             else Debug.LogError($"HandleData Unknown connectionId:{connectionId}");
         }
 
+        // called by transport
+        // IMPORTANT: often times when disconnecting, we call this from Mirror
+        //            too because we want to remove the connection and handle
+        //            the disconnect immediately.
+        //            => which is fine as long as we guarantee it only runs once
+        //            => which we do by removing the connection!
+        internal static void OnTransportDisconnected(int connectionId)
+        {
+            // Debug.Log($"Server disconnect client:{connectionId}");
+            if (connections.TryGetValue(connectionId, out NetworkConnectionToClient conn))
+            {
+                conn.Cleanup();
+                RemoveConnection(connectionId);
+                // Debug.Log($"Server lost client:{connectionId}");
+
+                // NetworkManager hooks into OnDisconnectedEvent to make
+                // DestroyPlayerForConnection(conn) optional, e.g. for PvP MMOs
+                // where players shouldn't be able to escape combat instantly.
+                if (OnDisconnectedEvent != null)
+                {
+                    OnDisconnectedEvent.Invoke(conn);
+                }
+                // if nobody hooked into it, then simply call DestroyPlayerForConnection
+                //else
+                //{
+                //    DestroyPlayerForConnection(conn);
+                //}
+            }
+        }
+
+        /// <summary>Removes a connection by connectionId. Returns true if removed.</summary>
+        public static bool RemoveConnection(int connectionId) =>
+            connections.Remove(connectionId);
+
+
+        // transport errors are forwarded to high level
+        static void OnTransportError(int connectionId, TransportError error, string reason)
+        {
+            // transport errors will happen. logging a warning is enough.
+            // make sure the user does not panic.
+            Debug.LogWarning($"Server Transport Error for connId={connectionId}: {error}: {reason}. This is fine.");
+            // try get connection. passes null otherwise.
+            connections.TryGetValue(connectionId, out NetworkConnectionToClient conn);
+            OnErrorEvent?.Invoke(conn, error, reason);
+        }
+
+        // transport errors are forwarded to high level
+        static void OnTransportException(int connectionId, Exception exception)
+        {
+            // transport errors will happen. logging a warning is enough.
+            // make sure the user does not panic.
+            Debug.LogWarning($"Server Transport Exception for connId={connectionId}: {exception}");
+            // try get connection. passes null otherwise.
+            connections.TryGetValue(connectionId, out NetworkConnectionToClient conn);
+            OnTransportExceptionEvent?.Invoke(conn, exception);
+        }
+
         internal static void RegisterMessageHandlers()
         {
             //todo: implement
             throw new NotImplementedException();
+        }
+
+        static void RemoveTransportHandlers()
+        {
+            // -= so that other systems can also hook into it (i.e. statistics)
+#pragma warning disable CS0618 // Type or member is obsolete
+            //Transport.active.OnServerConnected -= OnTransportConnected;
+#pragma warning restore CS0618 // Type or member is obsolete
+            Transport.active.OnServerConnectedWithAddress -= OnTransportConnectedWithAddress;
+            Transport.active.OnServerDataReceived -= OnTransportData;
+            Transport.active.OnServerDisconnected -= OnTransportDisconnected;
+            Transport.active.OnServerError -= OnTransportError;
+        }
+
+        // disconnect //////////////////////////////////////////////////////////
+        /// <summary>Disconnect all connections, including the local connection.</summary>
+        // synchronous: handles disconnect events and cleans up fully before returning!
+        public static void DisconnectAll()
+        {
+            // disconnect and remove all connections.
+            // we can not use foreach here because if
+            //   conn.Disconnect -> Transport.ServerDisconnect calls
+            //   OnDisconnect -> NetworkServer.OnDisconnect(connectionId)
+            // immediately then OnDisconnect would remove the connection while
+            // we are iterating here.
+            //   see also: https://github.com/vis2k/Mirror/issues/2357
+            // this whole process should be simplified some day.
+            // until then, let's copy .Values to avoid InvalidOperationException.
+            // note that this is only called when stopping the server, so the
+            // copy is no performance problem.
+            foreach (NetworkConnectionToClient conn in connections.Values.ToList())
+            {
+                // disconnect via connection->transport
+                conn.Disconnect();
+
+                // we want this function to be synchronous: handle disconnect
+                // events and clean up fully before returning.
+                // -> OnTransportDisconnected can safely be called without
+                //    waiting for the Transport's callback.
+                // -> it has checks to only run once.
+
+                // call OnDisconnected unless local player in host mod
+                // TODO unnecessary check?
+                //if (conn.connectionId != NetworkConnection.LocalConnectionId)
+                    OnTransportDisconnected(conn.connectionId);
+            }
+
+            // cleanup
+            connections.Clear();
+            //localConnection = null;
+            // this used to set active=false.
+            // however, then Shutdown can't properly destroy objects:
+            // https://github.com/MirrorNetworking/Mirror/issues/3344
+            // "DisconnectAll" should only disconnect all, not set inactive.
+            // active = false;
         }
     }
 }

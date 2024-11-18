@@ -4,6 +4,7 @@ using System.Collections.Generic;
 using System;
 using System.Text;
 using UnityEngine;
+using System.Runtime.CompilerServices;
 
 namespace Network
 {
@@ -73,7 +74,7 @@ namespace Network
 
         // version for handlers with channelId
         // inline! only exists for 20-30 messages and they call it all the time.
-        internal static NetworkMessageDelegate WrapHandler<T, C>(Action<C, T, int> handler, int messageId, bool requireAuthentication, bool exceptionsDisconnect)
+        internal static NetworkMessageDelegate WrapHandler<T, C>(Action<C, T, int> handler, ushort messageId, bool requireAuthentication, bool exceptionsDisconnect)
             where T : IMessage
             where C : NetworkConnection
             => (conn, reader, channeldId) =>
@@ -123,7 +124,7 @@ namespace Network
                     // user implemented handler
                     handler((C)conn, message, channeldId);
                 }
-                catch(Exception exception)
+                catch (Exception exception)
                 {
                     // should we disconnect on exceptions?
                     if (exceptionsDisconnect)
@@ -138,5 +139,18 @@ namespace Network
                     }
                 }
             };
+
+        // version for handlers without channelId
+        // TODO obsolete this some day to always use the channelId version.
+        //      all handlers in this version are wrapped with 1 extra action.
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        internal static NetworkMessageDelegate WrapHandler<T, C>(Action<C, T> handler, ushort messageId, bool requireAuthentication, bool exceptionsDisconnect)
+            where T : struct, IMessage
+            where C : NetworkConnection
+        {
+            // wrap action as channelId version, call original
+            void Wrapped(C conn, T msg, int _) => handler(conn, msg);
+            return WrapHandler((Action<C, T, int>)Wrapped, messageId, requireAuthentication, exceptionsDisconnect);
+        }
     }
 }
