@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.Linq;
+using Google.Protobuf;
 using Mirror;
 using UnityEngine;
 
@@ -295,6 +296,10 @@ namespace Network
             return false;
         }
 
+        /// <summary>Removes a connection by connectionId. Returns true if removed.</summary>
+        public static bool RemoveConnection(int connectionId) =>
+            connections.Remove(connectionId);
+
         internal static void OnConnected(NetworkConnectionToClient conn)
         {
             // Debug.Log($"Server accepted client:{conn}");
@@ -487,11 +492,6 @@ namespace Network
             }
         }
 
-        /// <summary>Removes a connection by connectionId. Returns true if removed.</summary>
-        public static bool RemoveConnection(int connectionId) =>
-            connections.Remove(connectionId);
-
-
         // transport errors are forwarded to high level
         static void OnTransportError(int connectionId, TransportError error, string reason)
         {
@@ -573,6 +573,71 @@ namespace Network
             // https://github.com/MirrorNetworking/Mirror/issues/3344
             // "DisconnectAll" should only disconnect all, not set inactive.
             // active = false;
+        }
+
+
+        // send ////////////////////////////////////////////////////////////////
+        /// <summary>Send a message to all clients, even those that haven't joined the world yet (non ready)</summary>
+        public static void SendToAll<T>(ushort messageId, T message, int channelId = Channels.Reliable, bool sendToReadyOnly = false)
+            where T : IMessage
+        {
+            if (!active)
+            {
+                Debug.LogWarning("Can not send using NetworkServer.SendToAll<T>(T msg) because NetworkServer is not active");
+                return;
+            }
+
+            // Debug.Log($"Server.SendToAll {typeof(T)}");
+            using (NetworkWriterPooled writer = NetworkWriterPool.Get())
+            {
+                // pack message only once
+                NetworkMessages.Pack(messageId, message, writer);
+                ArraySegment<byte> segment = writer.ToArraySegment();
+
+                // validate packet size immediately.
+                // we know how much can fit into one batch at max.
+                // if it's larger, log an error immediately with the type <T>.
+                // previously we only logged in Update() when processing batches,
+                // but there we don't have type information anymore.
+                int max = NetworkMessages.MaxMessageSize(channelId);
+                if (writer.Position > max)
+                {
+                    Debug.LogError($"NetworkServer.SendToAll: message of type {typeof(T)} with a size of {writer.Position} bytes is larger than the max allowed message size in one batch: {max}.\nThe message was dropped, please make it smaller.");
+                    return;
+                }
+
+                // filter and then send to all internet connections at once
+                // -> makes code more complicated, but is HIGHLY worth it to
+                //    avoid allocations, allow for multicast, etc.
+                int count = 0;
+                foreach (NetworkConnectionToClient conn in connections.Values)
+                {
+                    if (sendToReadyOnly && !conn.isReady)
+                        continue;
+
+                    count++;
+                    conn.Send(segment, channelId);
+                }
+
+                //NetworkDiagnostics.OnSend(message, channelId, segment.Count, count);
+            }
+        }
+
+        /// <summary>Register a handler for message type T. Most should require authentication.</summary>
+        // This version passes channelId to the handler.
+        public static void RegisterHandler<T>(Action<NetworkConnectionToClient, T, int> handler, ushort messageId, bool requireAuthentication = true)
+            where T : IMessage
+        {
+            ushort msgType = messageId;
+            if (handlers.ContainsKey(msgType))
+            {
+                Debug.LogWarning($"NetworkServer.RegisterHandler replacing handler for {typeof(T).FullName}, id={msgType}. If replacement is intentional, use ReplaceHandler instead to avoid this warning.");
+            }
+
+            // register Id <> Type in lookup for debugging.
+            NetworkMessages.Lookup[msgType] = typeof(T);
+
+            handlers[msgType] = NetworkMessages.WrapHandler(handler, messageId, requireAuthentication, exceptionsDisconnect);
         }
     }
 }
